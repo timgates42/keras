@@ -17,6 +17,8 @@ import importlib
 import json
 import os
 import types
+import zipfile
+import numpy as np
 
 import tensorflow.compat.v2 as tf
 
@@ -26,37 +28,93 @@ from keras.utils import generic_utils
 # isort: off
 from tensorflow.python.util import tf_export
 
-_CONFIG_FILE = "config.keras"
+_ARCHIVE_FILENAME = "archive.keras"
+_WEIGHTS_FILENAME = "weights.npz"
+_CONFIG_FILENAME = "config.json"
+_STATES_ROOT_DIRNAME = "model"
+_ARCHIVE_TEMP_DIRNAME = "archive_temp"
 
 # A temporary flag to enable the new idempotent saving framework.
 _ENABLED = False
 
 
+def _load_state(model, zip_dir_path, temp_path, z):
+    # TODO(rchao): Make `model.set_state()` an exported method and remove the
+    # attr check.
+    if hasattr(model, "set_state"):
+        extracted_path = z.extract(
+            tf.io.gfile.join(zip_dir_path, _WEIGHTS_FILENAME), temp_path
+        )
+        loaded_npz = np.load(extracted_path)
+        model.set_state([loaded_npz[file] for file in loaded_npz.files])
+        # TODO(rchao): Recursively load states for layers and optimizers.
+
+
 def load(dirpath):
-    """Load a saved python model."""
-    file_path = os.path.join(dirpath, _CONFIG_FILE)
-    with tf.io.gfile.GFile(file_path, "r") as f:
-        config_json = f.read()
-    config_dict = json_utils.decode(config_json)
-    return deserialize_keras_object(config_dict)
+    """Load a zip-archive representing a Keras model given the container dir."""
+    file_path = tf.io.gfile.join(dirpath, _ARCHIVE_FILENAME)
+    temp_path = tf.io.gfile.join(dirpath, _ARCHIVE_TEMP_DIRNAME)
+    with zipfile.ZipFile(file_path, "r") as z:
+        with z.open(_CONFIG_FILENAME, "r") as c:
+            config_json = c.read()
+        config_dict = json_utils.decode(config_json)
+        model = deserialize_keras_object(config_dict)
+        _load_state(model, _STATES_ROOT_DIRNAME, temp_path, z)
+    if tf.io.gfile.exists(temp_path):
+        tf.io.gfile.rmtree(temp_path)
+    return model
+
+
+def _save_state(model, zip_dir_path, temp_path, z):
+    # TODO(rchao): Make `model.get_state()` an exported method and remove the
+    # attr check.
+    if hasattr(model, "get_state"):
+        weights = model.get_state()
+        weight_file_path = tf.io.gfile.join(temp_path, _WEIGHTS_FILENAME)
+        np.savez(weight_file_path, *weights)
+        z.write(
+            weight_file_path, tf.io.gfile.join(zip_dir_path, _WEIGHTS_FILENAME)
+        )
+        tf.io.gfile.remove(weight_file_path)
+        # TODO(rchao): Recursively ask contained objects (layers, optimizers,
+        # etc.) to save states.
 
 
 def save(model, dirpath):
-    """Save a saved python model."""
+    """Save a zip-archive representing a Keras model given the container dir.
+
+    The zip-based archive contains the following structure:
+
+    - JSON-based configuration file (config.json): Records of model, layer, and
+        other components' configuration.
+    - NPZ-based component state files, found in respective directories, such as
+        model/weights.npz, model/dense_layer/weights.npz, etc.
+    - Metadata file (this is a TODO).
+    """
     if not tf.io.gfile.exists(dirpath):
         tf.io.gfile.mkdir(dirpath)
-    file_path = os.path.join(dirpath, _CONFIG_FILE)
+    file_path = tf.io.gfile.join(dirpath, _ARCHIVE_FILENAME)
 
     # TODO(rchao): Save the model's metadata (e.g. Keras version) in a separate
     # file in the archive.
-    # TODO(rchao): Save the model's state (e.g. layer weights/vocab) in a
-    # separate set of files in the archive.
-    # TODO(rchao): Write the config into a file in an archive. In this prototype
-    # we're temporarily settled on a standalone json file.
     serialized_model_dict = serialize_keras_object(model)
-    config_json = json.dumps(serialized_model_dict, cls=json_utils.Encoder)
-    with tf.io.gfile.GFile(file_path, "w") as f:
-        f.write(config_json)
+    config_json = json.dumps(
+        serialized_model_dict, cls=json_utils.Encoder
+    ).encode()
+
+    # Utilize a temporary directory for the interim npz files.
+    temp_path = tf.io.gfile.join(dirpath, _ARCHIVE_TEMP_DIRNAME)
+    if not tf.io.gfile.exists(temp_path):
+        tf.io.gfile.mkdir(temp_path)
+
+    # Save the configuration json and state npz's.
+    with zipfile.ZipFile(file_path, "x") as z:
+        with z.open(_CONFIG_FILENAME, "w") as c:
+            c.write(config_json)
+        _save_state(model, _STATES_ROOT_DIRNAME, temp_path, z)
+
+    # Remove the directory temporarily used.
+    tf.io.gfile.rmtree(temp_path)
 
 
 # TODO(rchao): Replace the current Keras' `deserialize_keras_object` with this

@@ -15,6 +15,7 @@
 """Tests for Keras python-based idempotent saving functions (experimental)."""
 import os
 import sys
+import zipfile
 
 import numpy as np
 import tensorflow.compat.v2 as tf
@@ -62,6 +63,12 @@ class CustomModelX(keras.Model):
 
     def one(self):
         return 1
+
+    def get_state(self):
+        return self.get_weights()
+
+    def set_state(self, state):
+        self.set_weights(state)
 
 
 @keras.utils.generic_utils.register_keras_serializable(
@@ -245,9 +252,10 @@ class NewSavingTest(tf.test.TestCase, parameterized.TestCase):
         subclassed_model.fit(x, y, epochs=1)
         subclassed_model._save_new(temp_dir)
 
-        file_path = os.path.join(temp_dir, saving_lib._CONFIG_FILE)
-        with tf.io.gfile.GFile(file_path, "r") as f:
-            config_json = f.read()
+        file_path = tf.io.gfile.join(temp_dir, saving_lib._ARCHIVE_FILENAME)
+        with zipfile.ZipFile(file_path, "r") as z:
+            with z.open(saving_lib._CONFIG_FILENAME, "r") as c:
+                config_json = c.read()
         config_dict = json_utils.decode(config_json)
         self.assertEqual(
             config_dict["registered_name"], "my_custom_package>CustomModelX"
@@ -264,6 +272,38 @@ class NewSavingTest(tf.test.TestCase, parameterized.TestCase):
         self.assertEqual(
             config_dict["config"]["loss"]["class_name"], "LossesContainer"
         )
+
+    def test_saving_model_state(self):
+        temp_dir = os.path.join(self.get_temp_dir(), "my_model")
+        subclassed_model = self._get_subclassed_model()
+        x = np.random.random((100, 32))
+        y = np.random.random((100, 1))
+        subclassed_model.fit(x, y, epochs=1)
+
+        # Assert that the archive has not been saved.
+        self.assertFalse(
+            os.path.exists(os.path.join(temp_dir, saving_lib._ARCHIVE_FILENAME))
+        )
+
+        subclassed_model._save_new(temp_dir)
+
+        # Assert that the archive has been saved.
+        self.assertTrue(
+            os.path.exists(os.path.join(temp_dir, saving_lib._ARCHIVE_FILENAME))
+        )
+
+        # Assert the temporarily created dir does not persist before and after
+        # loading.
+        self.assertFalse(os.path.exists(os.path.join(temp_dir, "tmp")))
+        loaded_model = saving_lib.load(temp_dir)
+        self.assertFalse(os.path.exists(os.path.join(temp_dir, "tmp")))
+
+        # The weights are supposed to be the same (between original and loaded
+        # models).
+        for subclassed_weights, loaded_weights in zip(
+            subclassed_model.get_weights(), loaded_model.get_weights()
+        ):
+            np.testing.assert_allclose(subclassed_weights, loaded_weights)
 
     @tf.__internal__.distribute.combinations.generate(
         tf.__internal__.test.combinations.combine(
